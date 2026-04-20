@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -41,6 +42,7 @@ STORES = {
 
 LISTINGS_PER_PAGE = 120
 OUTPUT_DIR        = Path(__file__).parent
+CHECKPOINT_DIR    = OUTPUT_DIR / "checkpoints"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,73 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("ebay_scraper")
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _checkpoint_path(seller: str) -> Path:
+    return CHECKPOINT_DIR / f"{seller}_checkpoint.json"
+
+
+def save_checkpoint(seller: str, listings: list[dict], products: list[dict],
+                    completed_ids: set, created_at: str) -> None:
+    """Write checkpoint atomically (tmp → rename) so a crash mid-write can't corrupt it."""
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    path = _checkpoint_path(seller)
+    data = {
+        "seller":        seller,
+        "created_at":    created_at,
+        "updated_at":    datetime.now().isoformat(),
+        "total":         len(listings),
+        "done":          len(completed_ids),
+        "listings":      listings,
+        "completed_ids": list(completed_ids),
+        "products":      products,
+    }
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    tmp.replace(path)
+    log.debug("  Checkpoint saved (%d/%d done)", len(completed_ids), len(listings))
+
+
+def load_checkpoint(seller: str) -> dict | None:
+    path = _checkpoint_path(seller)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        log.info(
+            "  Checkpoint found (created %s): %d/%d items already done.",
+            data.get("created_at", "?")[:19],
+            data.get("done", 0),
+            data.get("total", 0),
+        )
+        return data
+    except Exception as exc:
+        log.warning("  Could not read checkpoint (%s) — starting fresh.", exc)
+        return None
+
+
+def delete_checkpoint(seller: str) -> None:
+    path = _checkpoint_path(seller)
+    if path.exists():
+        path.unlink()
+        log.info("  Checkpoint deleted: %s", path.name)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds to a human-readable string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    elif s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    else:
+        return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
 
 # ---------------------------------------------------------------------------
 # Chrome driver factory
@@ -544,14 +613,15 @@ def scrape_listings(driver, seller: str, test_mode: bool) -> list[dict]:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException
 
-    wait     = WebDriverWait(driver, 20)
+    wait      = WebDriverWait(driver, 20)
     all_items: list[dict] = []
     page      = 1
     per_page  = 10 if test_mode else LISTINGS_PER_PAGE
+    t_start   = time.time()
 
     while True:
         url = seller_search_url(seller, page, per_page)
-        log.info("  Listings page %d: %s", page, url)
+        log.info("  Listings page %d  →  %s", page, url)
         driver.get(url)
 
         try:
@@ -584,19 +654,22 @@ def scrape_listings(driver, seller: str, test_mode: bool) -> list[dict]:
             break
 
         all_items.extend(items)
-        log.info("  Page %d: +%d listings  (total: %d)", page, len(items), len(all_items))
+        log.info("  Page %d: +%d listings  (running total: %d)", page, len(items), len(all_items))
 
         if test_mode:
             log.info("  Test mode: stopping after first page.")
             break
 
         if not has_next_page(html):
-            log.info("  No next page — done.")
             break
 
         page += 1
         time.sleep(random.uniform(2.5, 5.0))
 
+    log.info(
+        "  Listing collection done: %d items across %d page(s) in %s",
+        len(all_items), page, _fmt_duration(time.time() - t_start),
+    )
     return all_items
 
 # ---------------------------------------------------------------------------
@@ -636,31 +709,82 @@ def scrape_store(driver, seller: str, test_mode: bool) -> list[dict]:
     """
     Returns a list of fully enriched product dicts.
     Compatibility data is flattened into a single 'compatibility' column cell.
+
+    Checkpoint behaviour
+    --------------------
+    - On first run  : scrapes listing pages, saves checkpoint, then visits item pages.
+    - On resume     : loads checkpoint, skips already-completed items, continues from
+                      where the previous run stopped.  Listing pages are NOT re-scraped.
+    - On completion : checkpoint file is deleted by the caller (main).
+    - Checkpoint    : checkpoints/{seller}_checkpoint.json  (one file per store per run)
     """
-    log.info("  Collecting listings...")
-    listings = scrape_listings(driver, seller, test_mode)
+    checkpoint   = load_checkpoint(seller)
+    created_at   = datetime.now().isoformat()
 
-    if not listings:
-        return []
+    if checkpoint:
+        listings      = checkpoint["listings"]
+        products      = checkpoint["products"]
+        completed_ids = set(checkpoint["completed_ids"])
+        created_at    = checkpoint.get("created_at", created_at)
+        remaining     = len(listings) - len(completed_ids)
+        log.info("  Resuming: %d items left out of %d total.", remaining, len(listings))
+    else:
+        log.info("  Collecting listings...")
+        listings = scrape_listings(driver, seller, test_mode)
+        if not listings:
+            return []
+        products      = []
+        completed_ids = set()
+        # Save immediately so a crash during item-page scraping can be resumed
+        save_checkpoint(seller, listings, products, completed_ids, created_at)
 
-    log.info("  Visiting %d individual item pages for full details...", len(listings))
-    products: list[dict] = []
+    total         = len(listings)
+    pending       = total - len(completed_ids)
+    session_done  = 0
+    t_session     = time.time()
+
+    log.info("  ── Item pages ──────────────────────────────────────────")
+    log.info("  Total: %d  |  Already done: %d  |  Remaining: %d",
+             total, total - pending, pending)
+    log.info("  ────────────────────────────────────────────────────────")
 
     for i, item in enumerate(listings, 1):
-        log.info(
-            "  [%d/%d] %s — %s",
-            i, len(listings), item["item_id"], item["title"][:60],
-        )
+        if item["item_id"] in completed_ids:
+            log.debug("  [%d/%d] SKIP: %s", i, total, item["item_id"])
+            continue
+
+        pct = int(len(completed_ids) / total * 100)
+        log.info("  [%d/%d  %d%%]  %s — %s",
+                 i, total, pct, item["item_id"], item["title"][:55])
+
+        t_item_start = time.time()
         enriched, compat = scrape_item_page(driver, item)
-        enriched["compatibility"] = _compat_to_cell(compat)
-        if compat:
-            enriched["compatibility_count"] = len(compat)
-        else:
-            enriched["compatibility_count"] = 0
+        enriched["compatibility"]       = _compat_to_cell(compat)
+        enriched["compatibility_count"] = len(compat) if compat else 0
         products.append(enriched)
+        completed_ids.add(item["item_id"])
+        session_done += 1
+
+        # ETA based on average time per item this session
+        elapsed      = time.time() - t_session
+        item_elapsed = time.time() - t_item_start
+        avg_per_item = elapsed / session_done
+        remaining    = total - len(completed_ids)
+        eta          = _fmt_duration(remaining * avg_per_item) if remaining > 0 else "—"
+        rate         = session_done / (elapsed / 60)  # items per minute
+
+        log.info(
+            "      Done in %s  |  %.1f items/min  |  %d remaining  |  ETA %s",
+            _fmt_duration(item_elapsed), rate, remaining, eta,
+        )
+
+        # Persist after every item so an interruption loses at most one item
+        save_checkpoint(seller, listings, products, completed_ids, created_at)
 
         time.sleep(random.uniform(1.5, 3.0))
 
+    log.info("  ────────────────────────────────────────────────────────")
+    log.info("  Store complete: %d items in %s", len(products), _fmt_duration(time.time() - t_session))
     return products
 
 # ---------------------------------------------------------------------------
@@ -712,8 +836,16 @@ def save_products(products: list[dict], filename: str) -> None:
             df[col] = ""
     df = df.reindex(columns=PRODUCT_COLUMNS, fill_value="")
     df.index += 1
+
+    # Primary file (fixed name — always overwritten)
     df.to_csv(path, index_label="row", encoding="utf-8-sig")
     log.info("Saved %d products  ->  %s", len(df), path)
+
+    # Timestamped copy so each run is preserved
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts_path  = OUTPUT_DIR / f"{Path(filename).stem}_{ts}{Path(filename).suffix}"
+    df.to_csv(ts_path, index_label="row", encoding="utf-8-sig")
+    log.info("Timestamped copy  ->  %s", ts_path.name)
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -800,6 +932,7 @@ def main() -> None:
 
                 products = scrape_store(driver, seller, test_mode=args.test)
                 save_products(products, files["products"])
+                delete_checkpoint(seller)
 
                 if idx < len(stores) - 1:
                     pause = random.uniform(8, 15)
