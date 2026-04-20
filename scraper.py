@@ -796,11 +796,8 @@ PRODUCT_COLUMNS = [
     "item_id",
     "title",
     "price",
-    "listing_type",
     "condition",
     "shipping",
-    "location",
-    "watchers",
     # ── Item specifics ─────────────────────────────────────────────────────
     "brand",
     "sku",
@@ -818,7 +815,7 @@ PRODUCT_COLUMNS = [
     "extra_specifics",
     # ── Compatibility ──────────────────────────────────────────────────────
     "compatibility_count",
-    "compatibility",       # all vehicles in one cell, separated by " | "
+    "compatibility",
     # ── Media & link ───────────────────────────────────────────────────────
     "image_url",
     "url",

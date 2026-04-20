@@ -47,7 +47,7 @@ porschepartsdirect_products_20260420_143022.csv
 
 Single-item mode writes `single_product.csv` (+ timestamped copy).
 
-**Columns:** `item_id`, `title`, `price`, `listing_type`, `condition`, `shipping`, `location`, `watchers`, `brand`, `sku`, `manufacturer_part_number`, `genuine_oem`, `warranty`, `fitment_type`, `make`, `model`, `year`, `country_of_origin`, `color`, `material`, `upc`, `extra_specifics`, `compatibility_count`, `compatibility`, `image_url`, `url`
+**Columns:** `item_id`, `title`, `price`, `condition`, `shipping`, `brand`, `sku`, `manufacturer_part_number`, `genuine_oem`, `warranty`, `fitment_type`, `make`, `model`, `year`, `country_of_origin`, `color`, `material`, `upc`, `extra_specifics`, `compatibility_count`, `compatibility`, `image_url`, `url`
 
 ## Resume / Checkpoints
 
