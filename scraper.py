@@ -123,8 +123,10 @@ def _fmt_duration(seconds: float) -> str:
 # ---------------------------------------------------------------------------
 
 def make_driver(headless: bool):
+    import subprocess
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
 
     opts = Options()
     if headless:
@@ -133,14 +135,19 @@ def make_driver(headless: bool):
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_argument("--log-level=3")          # suppress Chrome INFO/WARNING noise
+    opts.add_argument("--disable-logging")      # suppress renderer logs
+    opts.add_argument("--disable-webrtc")       # suppress WebRTC/STUN errors
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+    # Redirect ChromeDriver's own log (the "DevTools listening on ws://..." line) to null
+    service = Service(log_output=subprocess.DEVNULL)
     try:
-        driver = webdriver.Chrome(options=opts)
+        driver = webdriver.Chrome(service=service, options=opts)
     except Exception as exc:
         log.error("Cannot start Chrome: %s", exc)
         sys.exit(1)
