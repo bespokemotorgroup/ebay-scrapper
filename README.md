@@ -48,7 +48,7 @@ porschepartsdirect_products_20260420_143022.csv
 Single-item mode writes `single_product.csv` (+ timestamped copy).
 
 **Columns:** `item_id`, `title`, `price`, `condition`, `shipping`, `brand`, `sku`, `manufacturer_part_number`, `genuine_oem`, `warranty`, `fitment_type`, `make`, `model`, `year`, `country_of_origin`, `color`, `material`, `upc`, `extra_specifics`, `compatibility_count`, `compatibility`, `image_url`, `url`
-
+ 
 ## Resume / Checkpoints
 
 If the scraper is interrupted, just re-run the same command — it picks up where it left off:
@@ -76,3 +76,5 @@ Progress, rate, and ETA are shown after each item:
 
 - If eBay shows a bot challenge, the scraper pauses 30 seconds and retries. In visible mode you can solve it manually in the browser window.
 - To add or remove stores, edit the `STORES` dict near the top of `scraper.py`.
+
+
