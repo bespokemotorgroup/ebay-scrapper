@@ -4,18 +4,19 @@ eBay Store Scraper
 Scrapes all listed products from two eBay stores, visits each item page for
 full details and compatibility data, then saves to CSV.
 
-Output (4 files total, same folder as script):
-    porschepartsdirect_products.csv      — one row per product, all item specifics
-    porschepartsdirect_compatibility.csv — one row per compatible vehicle (linked by item_id)
+Each run produces two files per store (same folder as script):
+    porschepartsdirect_products.csv       — raw scraped data, one row per product
+    porschepartsdirect_products_draft.csv — eBay AU draft upload template (ready to upload)
     5150motorsport_products.csv
-    5150motorsport_compatibility.csv
+    5150motorsport_products_draft.csv
 
 Usage:
     py -3 scraper.py                              # full scrape, both stores (visible Chrome)
     py -3 scraper.py --headless                   # headless Chrome
-    py -3 scraper.py --test                       # first page of listings only + item pages
+    py -3 scraper.py --test                       # scrape 1 product only, produce both CSVs
     py -3 scraper.py --store porschepartsdirect   # one store only
     py -3 scraper.py --store 5150motorsport --test
+    py -3 scraper.py --url https://www.ebay.com.au/itm/XXXXX
 """
 
 import argparse
@@ -30,6 +31,7 @@ from pathlib import Path
 
 import pandas as pd
 from bs4 import BeautifulSoup
+import generate_draft
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -43,6 +45,7 @@ STORES = {
 LISTINGS_PER_PAGE = 120
 OUTPUT_DIR        = Path(__file__).parent
 CHECKPOINT_DIR    = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_ARCHIVE_DIR = CHECKPOINT_DIR / "archive"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +108,23 @@ def delete_checkpoint(seller: str) -> None:
     if path.exists():
         path.unlink()
         log.info("  Checkpoint deleted: %s", path.name)
+
+
+def archive_checkpoint(seller: str) -> None:
+    """
+    Move a completed checkpoint into checkpoints/archive/ with a timestamp.
+    The live checkpoint path (checkpoints/<seller>_checkpoint.json) is only
+    touched here — after a successful full-store scrape — so crash-resume
+    logic is unaffected during a run.
+    """
+    path = _checkpoint_path(seller)
+    if not path.exists():
+        return
+    CHECKPOINT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = CHECKPOINT_ARCHIVE_DIR / f"{seller}_checkpoint_{ts}.json"
+    path.rename(dest)
+    log.info("  Checkpoint archived  ->  checkpoints/archive/%s", dest.name)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -337,6 +357,15 @@ def _parse_item_listing_details(soup: BeautifulSoup) -> dict:
     """
     result = {}
 
+    # ── Title ────────────────────────────────────────────────────────────────
+    title_el = (
+        soup.select_one("h1.x-item-title__mainTitle span.ux-textspans--BOLD") or
+        soup.select_one("h1.x-item-title__mainTitle span.ux-textspans") or
+        soup.select_one("h1.x-item-title__mainTitle")
+    )
+    if title_el:
+        result["title"] = title_el.get_text(strip=True)
+
     # ── Price ────────────────────────────────────────────────────────────────
     _price_re = re.compile(r'^(US\s*)?\$[\d,]+\.?\d*$')
     price_el = (
@@ -476,6 +505,100 @@ def _parse_item_specifics(soup: BeautifulSoup) -> dict:
     return result
 
 
+def _parse_category_id(soup: BeautifulSoup) -> str:
+    """
+    Extract the eBay leaf category ID from an item page.
+    Tries three sources in order:
+      1. Breadcrumb anchor hrefs  → ?_sacat=XXXXX
+      2. Inline <script> blocks   → "categoryId":"XXXXX"
+      3. JSON-LD structured data  → category / categoryId field
+    """
+    # 1. Breadcrumb links
+    for a in soup.select("a[href*='_sacat']"):
+        m = re.search(r'[?&]_sacat=(\d+)', a.get("href", ""))
+        if m:
+            return m.group(1)
+
+    # 2. Inline scripts (eBay embeds page state as JS objects)
+    for script in soup.select("script"):
+        text = script.string or ""
+        m = re.search(r'"categoryId"\s*:\s*"?(\d+)"?', text)
+        if m:
+            return m.group(1)
+
+    # 3. JSON-LD
+    for script in soup.select("script[type='application/ld+json']"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                for key in ("categoryId", "category"):
+                    val = str(item.get(key, ""))
+                    if val.isdigit():
+                        return val
+        except Exception:
+            pass
+
+    return ""
+
+
+def _scrape_description(driver, soup: BeautifulSoup) -> str:
+    """
+    Extract the full item description HTML from an item page.
+    eBay loads descriptions inside an iframe; this function handles both
+    the newer in-page layout and the classic iframe approach.
+    Returns the raw inner HTML string (as-is from eBay).
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import NoSuchElementException
+
+    # 1. Newer eBay layout — description rendered directly in the DOM
+    for selector in (
+        "div[data-testid='ux-layout-section-module-DESCRIPTION']",
+        "div.ux-layout-section--DESCRIPTION",
+        "div#desc_div",
+        "div.item-description",
+    ):
+        el = soup.select_one(selector)
+        if el and el.get_text(strip=True):
+            return el.decode_contents()
+
+    # 2. Classic iframe — switch into it and grab body innerHTML
+    try:
+        iframe = driver.find_element(
+            By.CSS_SELECTOR,
+            "iframe#desc_ifr, iframe[id*='desc_ifr'], iframe.desc_iframe",
+        )
+        driver.switch_to.frame(iframe)
+        try:
+            body_html = driver.find_element(By.TAG_NAME, "body").get_attribute("innerHTML")
+            return body_html or ""
+        finally:
+            driver.switch_to.default_content()
+    except (NoSuchElementException, Exception):
+        driver.switch_to.default_content()
+
+    # 3. Navigate to the iframe src URL directly (lazy-loaded iframes)
+    iframe_el = soup.select_one("iframe#desc_ifr, iframe[id*='desc']")
+    if iframe_el:
+        src = iframe_el.get("src", "")
+        if src and src.startswith("http"):
+            try:
+                current_url = driver.current_url
+                driver.get(src)
+                time.sleep(random.uniform(1.2, 2.0))
+                desc_soup = BeautifulSoup(driver.page_source, "lxml")
+                body = desc_soup.select_one("body")
+                content = body.decode_contents() if body else ""
+                driver.get(current_url)
+                time.sleep(random.uniform(1.2, 2.0))
+                return content
+            except Exception:
+                pass
+
+    return ""
+
+
 def _parse_compatibility_page(soup: BeautifulSoup) -> list[dict]:
     """
     Parse one page of the compatibility table.
@@ -543,7 +666,11 @@ def scrape_item_page(driver, item: dict) -> tuple[dict, list[dict]]:
     listing_details = _parse_item_listing_details(soup)
     listing_fill = {k: v for k, v in listing_details.items() if not item.get(k) and v}
 
-    enriched = {**item, **listing_fill, **specifics}
+    category_id = _parse_category_id(soup)
+    description = _scrape_description(driver, soup)
+
+    enriched = {**item, **listing_fill, **specifics,
+                "category_id": category_id, "description": description}
 
     # ── Compatibility table — scroll to it, then paginate ─────────────────
     compat_rows: list[dict] = []
@@ -772,6 +899,10 @@ def scrape_store(driver, seller: str, test_mode: bool) -> list[dict]:
         completed_ids.add(item["item_id"])
         session_done += 1
 
+        if test_mode:
+            log.info("  Test mode: stopping after 1 product.")
+            break
+
         # ETA based on average time per item this session
         elapsed      = time.time() - t_session
         item_elapsed = time.time() - t_item_start
@@ -805,6 +936,7 @@ PRODUCT_COLUMNS = [
     "price",
     "condition",
     "shipping",
+    "category_id",
     # ── Item specifics ─────────────────────────────────────────────────────
     "brand",
     "sku",
@@ -826,6 +958,8 @@ PRODUCT_COLUMNS = [
     # ── Media & link ───────────────────────────────────────────────────────
     "image_url",
     "url",
+    # ── Description ────────────────────────────────────────────────────────
+    "description",
 ]
 
 
@@ -841,7 +975,7 @@ def save_products(products: list[dict], filename: str) -> None:
     df = df.reindex(columns=PRODUCT_COLUMNS, fill_value="")
     df.index += 1
 
-    # Primary file (fixed name — always overwritten)
+    # Primary scraped CSV (fixed name — always overwritten)
     df.to_csv(path, index_label="row", encoding="utf-8-sig")
     log.info("Saved %d products  ->  %s", len(df), path)
 
@@ -850,6 +984,7 @@ def save_products(products: list[dict], filename: str) -> None:
     ts_path  = OUTPUT_DIR / f"{Path(filename).stem}_{ts}{Path(filename).suffix}"
     df.to_csv(ts_path, index_label="row", encoding="utf-8-sig")
     log.info("Timestamped copy  ->  %s", ts_path.name)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -886,6 +1021,10 @@ def scrape_single_url(driver, url: str) -> None:
 
     save_products([enriched], "single_product.csv")
 
+    draft_path = OUTPUT_DIR / "single_product_draft.csv"
+    log.info("Generating eBay draft  ->  single_product_draft.csv")
+    generate_draft.generate_draft_from_df(pd.DataFrame([enriched]), str(draft_path))
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -903,7 +1042,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--test", action="store_true",
-        help="Test mode: first page of listings only (10 items) to verify output.",
+        help="Test mode: scrape exactly 1 product and produce both output CSVs.",
     )
     parser.add_argument(
         "--url",
@@ -930,18 +1069,26 @@ def main() -> None:
         if args.url:
             scrape_single_url(driver, args.url)
         else:
+            all_products = []
             for idx, (seller, files) in enumerate(stores.items()):
                 log.info("")
                 log.info(">>> Store: %s", seller)
 
                 products = scrape_store(driver, seller, test_mode=args.test)
                 save_products(products, files["products"])
-                delete_checkpoint(seller)
+                all_products.extend(products)
+                archive_checkpoint(seller)
 
                 if idx < len(stores) - 1:
                     pause = random.uniform(8, 15)
                     log.info("Pausing %.1f s before next store...", pause)
                     time.sleep(pause)
+
+            if all_products:
+                import pandas as pd
+                draft_path = OUTPUT_DIR / "ebay_draft.csv"
+                log.info("Generating combined eBay draft  ->  ebay_draft.csv  (%d listings)", len(all_products))
+                generate_draft.generate_draft_from_df(pd.DataFrame(all_products), str(draft_path))
     finally:
         driver.quit()
 
