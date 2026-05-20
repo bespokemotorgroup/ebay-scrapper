@@ -523,31 +523,43 @@ def _parse_item_specifics(soup: BeautifulSoup) -> dict:
             extra.append(f"{label}: {value}")
 
     result["extra_specifics"] = " | ".join(extra) if extra else ""
+
+    # If no explicit SKU field, fall back to manufacturer_part_number
+    if not result.get("sku") and result.get("manufacturer_part_number"):
+        result["sku"] = result["manufacturer_part_number"]
+
     return result
 
 
 def _parse_category_id(soup: BeautifulSoup) -> str:
     """
     Extract the eBay leaf category ID from an item page.
-    Tries three sources in order:
-      1. Breadcrumb anchor hrefs  → ?_sacat=XXXXX
-      2. Inline <script> blocks   → "categoryId":"XXXXX"
-      3. JSON-LD structured data  → category / categoryId field
+    Tries multiple sources in order, most reliable first.
     """
-    # 1. Breadcrumb links
+    # 1. Breadcrumb links — take the LAST _sacat link (leaf category, not root)
+    sacat_ids = []
     for a in soup.select("a[href*='_sacat']"):
         m = re.search(r'[?&]_sacat=(\d+)', a.get("href", ""))
         if m:
-            return m.group(1)
+            sacat_ids.append(m.group(1))
+    if sacat_ids:
+        return sacat_ids[-1]
 
-    # 2. Inline scripts (eBay embeds page state as JS objects)
-    for script in soup.select("script"):
-        text = script.string or ""
-        m = re.search(r'"categoryId"\s*:\s*"?(\d+)"?', text)
-        if m:
-            return m.group(1)
+    # 2. Inline scripts — leafCatId is the most specific; fall back to others
+    #    Skip tiny values (< 10) which are root/parent placeholders, not real categories
+    for pattern in [
+        re.compile(r'"leafCatId"\s*:\s*"?(\d+)"?'),
+        re.compile(r'"primaryCategoryId"\s*:\s*"?(\d+)"?'),
+        re.compile(r'primaryCategory\s*[:{][^}]*categoryId["\s:]+(\d+)'),
+        re.compile(r'"(?:categoryId|cat_id|catId)"\s*:\s*"?(\d+)"?'),
+    ]:
+        for script in soup.select("script"):
+            text = script.string or ""
+            m = pattern.search(text)
+            if m and int(m.group(1)) > 10:
+                return m.group(1)
 
-    # 3. JSON-LD
+    # 3. JSON-LD structured data
     for script in soup.select("script[type='application/ld+json']"):
         try:
             data = json.loads(script.string or "")
@@ -555,10 +567,16 @@ def _parse_category_id(soup: BeautifulSoup) -> str:
             for item in items:
                 for key in ("categoryId", "category"):
                     val = str(item.get(key, ""))
-                    if val.isdigit():
+                    if val.isdigit() and int(val) > 10:
                         return val
         except Exception:
             pass
+
+    # 4. Meta tags
+    for meta in soup.select("meta[name='category'], meta[name='CategoryID']"):
+        val = meta.get("content", "").strip()
+        if val.isdigit() and int(val) > 10:
+            return val
 
     return ""
 

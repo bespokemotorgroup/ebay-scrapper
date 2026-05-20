@@ -92,6 +92,16 @@ _CONDITION_MAP = {
 }
 
 
+def _clean(value) -> str:
+    """Convert any value to a clean string, treating NaN/None as empty."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:  # NaN check
+        return ""
+    s = str(value).strip()
+    return "" if s.lower() == "nan" else s
+
+
 def _map_condition(raw: str) -> str:
     key = raw.strip().lower()
     for k, v in _CONDITION_MAP.items():
@@ -113,19 +123,17 @@ def _clean_price(raw: str) -> str:
 
 def _first(value) -> str:
     """Return the first value when a field contains multiple comma-separated entries."""
-    s = str(value or "").strip()
+    s = _clean(value)
     return s.split(",")[0].strip() if "," in s else s
 
 
 def _resolve_sku(row: pd.Series) -> str:
-    """Return a single clean SKU token: sku → manufacturer_part_number → item_id.
-    Takes the first value if multiple are present, strips dashes."""
-    raw = (
+    """Return SKU: sku → manufacturer_part_number → item_id. Takes first if multiple."""
+    return (
         _first(row.get("sku"))
         or _first(row.get("manufacturer_part_number"))
-        or str(row.get("item_id") or "").strip()
+        or _clean(row.get("item_id"))
     )
-    return raw.replace("-", "").replace(" ", "")
 
 
 def _compat_to_html_table(compat_str: str) -> str:
@@ -174,8 +182,8 @@ def _compat_to_html_table(compat_str: str) -> str:
 
 
 def build_draft_row(row: pd.Series, default_qty: int) -> list:
-    description = str(row.get("description", ""))
-    compat_html = _compat_to_html_table(str(row.get("compatibility", "")))
+    description = _clean(row.get("description", ""))
+    compat_html = _compat_to_html_table(_clean(row.get("compatibility", "")))
     if compat_html:
         description = description + compat_html
 
@@ -183,15 +191,15 @@ def build_draft_row(row: pd.Series, default_qty: int) -> list:
         # ── Core listing fields ───────────────────────────────────────────
         "Draft",
         _resolve_sku(row),
-        row.get("category_id", ""),
-        str(row.get("title", ""))[:80],
-        row.get("upc", ""),
-        _clean_price(str(row.get("price", ""))),
+        _clean(row.get("category_id", "")),
+        _clean(row.get("title", ""))[:80],
+        _clean(row.get("upc", "")),
+        _clean_price(_clean(row.get("price", ""))),
         default_qty,
-        row.get("image_url", ""),
-        _map_condition(str(row.get("condition", ""))),
+        _clean(row.get("image_url", "")),
+        _map_condition(_clean(row.get("condition", ""))),
         description,
-        _map_format(str(row.get("listing_type", ""))),
+        _map_format(_clean(row.get("listing_type", ""))),
         # ── Item Specifics (C: columns) ───────────────────────────────────
         _first(row.get("brand")),
         _first(row.get("manufacturer_part_number")),
