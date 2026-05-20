@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Update : 5/20
 eBay Store Scraper
 Scrapes all listed products from two eBay stores, visits each item page for
 full details and compatibility data, then saves to CSV.
@@ -451,22 +452,42 @@ def _parse_item_listing_details(soup: BeautifulSoup) -> dict:
                 result["watchers"] = t
                 break
 
-    # ── Image ────────────────────────────────────────────────────────────────
-    img_el = (
-        soup.select_one("div.ux-image-carousel-item.active img") or
-        soup.select_one("div.ux-image-carousel-item img") or
-        soup.select_one("img.ux-image-carousel-image") or
-        soup.select_one("div[data-testid='ux-image-carousel-item'] img")
+    # ── Images (all carousel images, deduplicated, videos excluded) ─────────
+    _video_url_re = re.compile(r'(youtube|youtu\.be|vimeo|\.mp4|\.webm|\.mov)', re.IGNORECASE)
+    carousel_items = (
+        soup.select("div.ux-image-carousel-item") or
+        soup.select("div[data-testid='ux-image-carousel-item']")
     )
-    if img_el:
+    srcs = []
+    seen: set[str] = set()
+    for item_div in carousel_items:
+        # Skip carousel slots that contain a video element or have a video class
+        if item_div.select_one("video"):
+            continue
+        classes = " ".join(item_div.get("class") or []).lower()
+        if "video" in classes:
+            continue
+        img_el = item_div.select_one("img")
+        if not img_el:
+            continue
         src = (
             img_el.get("src") or
             img_el.get("data-src") or
             img_el.get("data-defer-load") or
             ""
         )
-        if src:
-            result["image_url"] = src
+        if src and src not in seen and not _video_url_re.search(src):
+            seen.add(src)
+            srcs.append(src)
+    # Fallback: no carousel wrapper divs found, grab imgs directly
+    if not srcs:
+        for img_el in soup.select("img.ux-image-carousel-image"):
+            src = img_el.get("src") or img_el.get("data-src") or img_el.get("data-defer-load") or ""
+            if src and src not in seen and not _video_url_re.search(src):
+                seen.add(src)
+                srcs.append(src)
+    if srcs:
+        result["image_url"] = "|".join(srcs)
 
     return result
 
@@ -663,8 +684,12 @@ def scrape_item_page(driver, item: dict) -> tuple[dict, list[dict]]:
 
     # Fill listing-level fields (price, condition, etc.) from the item page
     # for any fields that were not populated from a search-results card.
+    # image_url always comes from the item page (full-res, all images).
     listing_details = _parse_item_listing_details(soup)
+    image_url_from_page = listing_details.pop("image_url", "")
     listing_fill = {k: v for k, v in listing_details.items() if not item.get(k) and v}
+    if image_url_from_page:
+        listing_fill["image_url"] = image_url_from_page
 
     category_id = _parse_category_id(soup)
     description = _scrape_description(driver, soup)
